@@ -1,0 +1,5 @@
+ctypes
+keyboard
+pyautogui
+tkinter
+ttkbootstrap
