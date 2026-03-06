@@ -1,0 +1,8 @@
+__future__
+concurrent
+customtkinter
+dataclasses
+pandas
+requests
+tkinter
+yaml
