@@ -1,0 +1,4 @@
+configparser
+customtkinter
+pandas
+tkinter
