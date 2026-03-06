@@ -1,6 +1,0 @@
-customtkinter
-openpyxl
-pandas
-pythoncom
-tkinter
-win32com

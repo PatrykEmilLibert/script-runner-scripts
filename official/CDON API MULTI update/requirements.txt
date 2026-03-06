@@ -1,5 +1,0 @@
-concurrent
-customtkinter
-requests
-tkinter
-traceback
