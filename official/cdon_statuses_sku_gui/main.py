@@ -14,7 +14,7 @@ import requests
 
 
 APP_TITLE = "CDON Artykuly"
-DEFAULT_ACCOUNTS_PATH = rstr((Path(__file__).parent / "accounts.csv").resolve())
+DEFAULT_ACCOUNTS_PATH = str((Path(__file__).parent / "accounts.csv").resolve())
 SANDBOX_BASE_URL = "https://merchants-api.sandbox.cdon.com/api"
 PROD_BASE_URL = "https://merchants-api.cdon.com/api"
 ARTICLES_ENDPOINT = "/v1/articles"
