@@ -56,6 +56,7 @@ CSV_FIELDNAMES = [
     "currency_NO",
     "active",
     "status",
+    "real_status",
 ]
 
 
@@ -611,6 +612,10 @@ class CDONArticlesClient:
         active = self._extract_active(article)
         status = str(article.get("status", ""))
 
+        is_for_sale = bool(active is True)
+        has_stock = isinstance(qty, int) and qty > 0
+        real_status = "aktywne" if (is_for_sale and has_stock) else "nieaktywne"
+
         return {
             "sku": sku,
             "name": title,
@@ -628,6 +633,7 @@ class CDONArticlesClient:
             "currency_NO": prices.get("NO", {}).get("currency", ""),
             "active": active,
             "status": status,
+            "real_status": real_status,
         }
 
     def export_articles_to_csv(self, output_path, page_limit=DEFAULT_PAGE_LIMIT, stop_event=None):
@@ -728,13 +734,14 @@ class App(ctk.CTk):
         self.configure(fg_color=BG_MAIN)
 
         self.accounts_path_var = ctk.StringVar(value=DEFAULT_ACCOUNTS_PATH)
-        self.account_var = ctk.StringVar(value="")
         self.output_csv_var = ctk.StringVar(value="")
         self.use_sandbox_var = ctk.BooleanVar(value=False)
         self.rate_limit_var = ctk.StringVar(value=str(DEFAULT_REQUESTS_PER_MINUTE))
         self.page_limit_var = ctk.StringVar(value=str(DEFAULT_PAGE_LIMIT))
 
         self.accounts = {}
+        self.account_check_vars = {}
+        self.accounts_checks_frame = None
         self.is_running = False
         self.stop_event = threading.Event()
 
@@ -811,19 +818,15 @@ class App(ctk.CTk):
         ).grid(row=row, column=2, padx=(8, 14), pady=10)
 
         row += 1
-        ctk.CTkLabel(config, text="Konto (podglad)", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
-        self.account_menu = ctk.CTkOptionMenu(
+        ctk.CTkLabel(config, text="Konta (ptaszki)", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="nw")
+        self.accounts_checks_frame = ctk.CTkScrollableFrame(
             config,
-            variable=self.account_var,
-            values=["Brak kont"],
-            fg_color=ACCENT,
-            button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER,
-            dropdown_fg_color=BG_PANEL,
-            dropdown_text_color=TEXT,
-            text_color="#ffffff",
+            fg_color=BG_INPUT,
+            border_color=BORDER,
+            border_width=1,
+            height=120,
         )
-        self.account_menu.grid(row=row, column=1, padx=8, pady=10, sticky="ew")
+        self.accounts_checks_frame.grid(row=row, column=1, padx=8, pady=10, sticky="ew")
         ctk.CTkButton(
             config,
             text="Odswiez",
@@ -834,7 +837,7 @@ class App(ctk.CTk):
         ).grid(row=row, column=2, padx=(8, 14), pady=10)
 
         row += 1
-        ctk.CTkLabel(config, text="Folder/plik wynikowy", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
+        ctk.CTkLabel(config, text="Folder bazowy", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
         ctk.CTkEntry(config, textvariable=self.output_csv_var, fg_color=BG_INPUT, text_color=TEXT).grid(
             row=row, column=1, padx=8, pady=10, sticky="ew"
         )
@@ -958,20 +961,51 @@ class App(ctk.CTk):
             self._load_accounts()
 
     def _pick_output_csv(self):
-        path = filedialog.asksaveasfilename(
-            title="Zapisz wynik jako",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv")],
-        )
+        path = filedialog.askdirectory(title="Wybierz folder bazowy eksportu")
         if path:
             self.output_csv_var.set(path)
+
+    def _refresh_accounts_checkboxes(self):
+        if self.accounts_checks_frame is None:
+            return
+
+        for child in self.accounts_checks_frame.winfo_children():
+            child.destroy()
+
+        self.account_check_vars = {}
+        names = sorted(self.accounts.keys())
+        if not names:
+            ctk.CTkLabel(self.accounts_checks_frame, text="Brak kont", text_color=TEXT_MUTED).grid(
+                row=0, column=0, padx=8, pady=8, sticky="w"
+            )
+            return
+
+        for idx, name in enumerate(names):
+            var = ctk.BooleanVar(value=True)
+            self.account_check_vars[name] = var
+            ctk.CTkCheckBox(
+                self.accounts_checks_frame,
+                text=name,
+                variable=var,
+                text_color=TEXT,
+                fg_color=ACCENT,
+                hover_color=ACCENT_HOVER,
+                border_color=BORDER,
+            ).grid(row=idx, column=0, padx=8, pady=4, sticky="w")
+
+    def _get_selected_accounts(self):
+        selected = []
+        for name, var in self.account_check_vars.items():
+            if var.get() and name in self.accounts:
+                selected.append((name, self.accounts[name]))
+        return selected
 
     def _load_accounts(self):
         path = self.accounts_path_var.get().strip()
         self.accounts = {}
 
         if not path or not os.path.exists(path):
-            self._set_account_menu(["Brak kont"])
+            self._refresh_accounts_checkboxes()
             self._log("Nie znaleziono pliku kont.", ERROR)
             return
 
@@ -994,39 +1028,32 @@ class App(ctk.CTk):
                         }
 
             if not self.accounts:
-                self._set_account_menu(["Brak kont"])
+                self._refresh_accounts_checkboxes()
                 self._log("Plik kont wczytany, ale brak poprawnych rekordow.", ERROR)
                 return
 
             names = sorted(self.accounts.keys())
-            self._set_account_menu(names)
-            self.account_var.set(names[0])
+            self._refresh_accounts_checkboxes()
             self._log(f"Wczytano konta: {len(names)}", SUCCESS)
         except Exception as exc:
-            self._set_account_menu(["Brak kont"])
+            self._refresh_accounts_checkboxes()
             self._log(f"Blad czytania pliku kont: {exc}", ERROR)
-
-    def _set_account_menu(self, values):
-        self.account_menu.configure(values=values)
-        if values:
-            self.account_var.set(values[0])
 
     def _validate(self):
         if self.is_running:
             return False
 
-        account_name = self.account_var.get().strip()
-        if not account_name or account_name not in self.accounts:
-            messagebox.showerror("Blad", "Wybierz poprawne konto z listy.")
-            return False
-
         output_path = self.output_csv_var.get().strip()
         if not output_path:
-            messagebox.showerror("Blad", "Wybierz folder lub plik wynikowy.")
+            messagebox.showerror("Blad", "Wybierz folder bazowy eksportu.")
             return False
 
         if not self.accounts:
             messagebox.showerror("Blad", "Brak kont do pobrania.")
+            return False
+
+        if not self._get_selected_accounts():
+            messagebox.showerror("Blad", "Zaznacz co najmniej jedno konto (ptaszkiem).")
             return False
 
         try:
@@ -1075,10 +1102,12 @@ class App(ctk.CTk):
             req_per_min = int(self.rate_limit_var.get().strip())
             page_limit = int(self.page_limit_var.get().strip())
             use_sandbox = bool(self.use_sandbox_var.get())
-            output_dir = self._resolve_output_dir(output_path)
+            base_output_dir = self._resolve_output_dir(output_path)
+            export_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.join(base_output_dir, f"exporty CDON {export_stamp}")
             os.makedirs(output_dir, exist_ok=True)
             run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            accounts_to_fetch = list(self.accounts.items())
+            accounts_to_fetch = self._get_selected_accounts()
 
             if not accounts_to_fetch:
                 raise RuntimeError("Brak kont do pobrania.")
@@ -1087,6 +1116,7 @@ class App(ctk.CTk):
             self._log(f"Srodowisko: {'SANDBOX' if use_sandbox else 'PRODUKCJA'}")
             self._log(f"Limit API: {req_per_min} req/min")
             self._log(f"Page limit: {page_limit}")
+            self._log(f"Folder bazowy: {base_output_dir}")
             self._log(f"Folder wyjsciowy: {output_dir}")
 
             self._log("Pobieranie artykulow z API ze wszystkich kont...")
