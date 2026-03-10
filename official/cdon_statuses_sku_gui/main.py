@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import csv
 import json
 import os
@@ -12,11 +13,11 @@ import customtkinter as ctk
 import requests
 
 
-APP_TITLE = "CDON Statusy Ofert po SKU"
+APP_TITLE = "CDON Artykuly"
 DEFAULT_ACCOUNTS_PATH = rstr((Path(__file__).parent / "accounts.csv").resolve())
 SANDBOX_BASE_URL = "https://merchants-api.sandbox.cdon.com/api"
 PROD_BASE_URL = "https://merchants-api.cdon.com/api"
-STATUS_BY_SKU_ENDPOINT = "/v1/statuses/sku"
+ARTICLES_ENDPOINT = "/v1/articles"
 
 ACCENT = "#ff69b4"
 ACCENT_HOVER = "#ec4fa3"
@@ -33,11 +34,47 @@ DEFAULT_REQUESTS_PER_MINUTE = 300
 MAX_REQUESTS_PER_MINUTE = 350
 DEFAULT_MAX_RETRIES = 6
 DEFAULT_BACKOFF_SECONDS = 1.5
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 10000
+PAGE_BURST_SIZE = 350
+PAGE_BURST_PAUSE_SECONDS = 0
+
+CSV_FIELDNAMES = [
+    "sku",
+    "name",
+    "quantity",
+    "price",
+    "currency",
+    "price_market",
+    "price_SE",
+    "currency_SE",
+    "price_DK",
+    "currency_DK",
+    "price_FI",
+    "currency_FI",
+    "price_NO",
+    "currency_NO",
+    "active",
+    "status",
+]
 
 
-def chunks(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
+def safe_float(value):
+    if value is None:
+        return ""
+    try:
+        return float(str(value).replace(",", "."))
+    except ValueError:
+        return ""
+
+
+def safe_int(value):
+    if value is None or value == "":
+        return ""
+    try:
+        return int(float(value))
+    except ValueError:
+        return ""
 
 
 class RequestRateLimiter:
@@ -59,7 +96,7 @@ class RequestRateLimiter:
             time.sleep(min(wait_for, 0.5))
 
 
-class CDONStatusesClient:
+class CDONArticlesClient:
     def __init__(
         self,
         merchant_id,
@@ -85,21 +122,26 @@ class CDONStatusesClient:
         auth_basic = base64.b64encode(auth_raw).decode("ascii")
         return {
             "Authorization": f"Basic {auth_basic}",
-            "Content-Type": "application/json",
             "Accept": "application/json",
+            "Content-Type": "application/json",
             "x-merchant-id": self.merchant_id,
-            "User-Agent": "CDON-Statuses-SKU-GUI/1.0",
+            "User-Agent": "CDON-Articles-GUI/1.0",
         }
 
-    def fetch_statuses_by_skus(self, skus):
-        url = f"{self.base_url}{STATUS_BY_SKU_ENDPOINT}"
-        payload = {"skus": skus}
+    def _request_with_retry(self, method, url, skip_rate_limiter=False, **kwargs):
         transient_http_codes = {429, 500, 502, 503, 504}
 
         for attempt in range(self.max_retries + 1):
-            self.rate_limiter.wait_turn()
+            if not skip_rate_limiter:
+                self.rate_limiter.wait_turn()
             try:
-                response = requests.post(url, headers=self._headers(), json=payload, timeout=self.timeout)
+                response = requests.request(
+                    method=method,
+                    url=url,
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                    **kwargs,
+                )
             except (requests.Timeout, requests.ConnectionError) as exc:
                 if attempt >= self.max_retries:
                     raise RuntimeError(f"Blad polaczenia po {attempt + 1} probach: {exc}") from exc
@@ -107,12 +149,6 @@ class CDONStatusesClient:
                 self.log(f"Polaczenie nieudane. Retry {attempt + 1}/{self.max_retries} za {wait_time:.1f}s")
                 time.sleep(wait_time)
                 continue
-
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError("API zwrocilo niepoprawny JSON") from exc
 
             if response.status_code in transient_http_codes and attempt < self.max_retries:
                 retry_after_header = response.headers.get("Retry-After", "").strip()
@@ -127,21 +163,557 @@ class CDONStatusesClient:
                     wait_time = min(90.0, self.backoff_seconds * (2**attempt))
 
                 if response.status_code == 429:
-                    self.log(
-                        f"HTTP 429 (limit). Retry {attempt + 1}/{self.max_retries} za {wait_time:.1f}s"
-                    )
+                    self.log(f"HTTP 429 (limit). Retry {attempt + 1}/{self.max_retries} za {wait_time:.1f}s")
                 else:
-                    self.log(
-                        f"HTTP {response.status_code}. Retry {attempt + 1}/{self.max_retries} za {wait_time:.1f}s"
-                    )
+                    self.log(f"HTTP {response.status_code}. Retry {attempt + 1}/{self.max_retries} za {wait_time:.1f}s")
 
                 time.sleep(wait_time)
                 continue
 
-            text = response.text[:500]
-            raise RuntimeError(f"HTTP {response.status_code}: {text}")
+            return response
 
-        raise RuntimeError("Nie udalo sie pobrac statusow po wielu probach")
+        raise RuntimeError("Nie udalo sie wykonac zapytania po wielu probach")
+
+    @staticmethod
+    def _page_size_params(page_limit):
+        # Hidden endpoints sometimes use non-standard names for page size.
+        return {
+            "limit": page_limit,
+            "page_size": page_limit,
+            "pageSize": page_limit,
+            "per_page": page_limit,
+            "perPage": page_limit,
+        }
+
+    @staticmethod
+    def _extract_articles(payload):
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return []
+
+        for key in ["articles", "items", "results", "data"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    @staticmethod
+    def _extract_total_count(payload):
+        if not isinstance(payload, dict):
+            return None
+        for key in ["total", "total_count", "totalCount", "count"]:
+            value = payload.get(key)
+            if isinstance(value, int) and value >= 0:
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        meta = payload.get("meta")
+        if isinstance(meta, dict):
+            for key in ["total", "total_count", "totalCount", "count"]:
+                value = meta.get(key)
+                if isinstance(value, int) and value >= 0:
+                    return value
+                if isinstance(value, str) and value.isdigit():
+                    return int(value)
+        return None
+
+    @staticmethod
+    def _extract_next_link(payload):
+        if not isinstance(payload, dict):
+            return ""
+
+        direct = payload.get("next") or payload.get("next_url") or payload.get("nextUrl")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+        links = payload.get("links")
+        if isinstance(links, dict):
+            candidate = links.get("next")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        paging = payload.get("paging")
+        if isinstance(paging, dict):
+            candidate = paging.get("next")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        return ""
+
+    @staticmethod
+    def _extract_next_cursor(payload):
+        if not isinstance(payload, dict):
+            return "", ""
+
+        cursor_map = {
+            "cursor": "cursor",
+            "next_cursor": "cursor",
+            "nextCursor": "cursor",
+            "continuation": "continuation",
+            "continuation_token": "continuation",
+            "continuationToken": "continuation",
+            "next_token": "next_token",
+            "nextToken": "next_token",
+            "page_token": "page_token",
+            "pageToken": "page_token",
+        }
+
+        for src_key, request_key in cursor_map.items():
+            value = payload.get(src_key)
+            if isinstance(value, str) and value.strip():
+                return request_key, value.strip()
+
+        paging = payload.get("paging")
+        if isinstance(paging, dict):
+            for src_key, request_key in cursor_map.items():
+                value = paging.get(src_key)
+                if isinstance(value, str) and value.strip():
+                    return request_key, value.strip()
+
+        return "", ""
+
+    @staticmethod
+    def _batch_fingerprint(items):
+        if not items:
+            return (0, "", "")
+        first = items[0] if isinstance(items[0], dict) else {}
+        last = items[-1] if isinstance(items[-1], dict) else {}
+        return (
+            len(items),
+            str(first.get("sku") or first.get("article_sku") or ""),
+            str(last.get("sku") or last.get("article_sku") or ""),
+        )
+
+    def _fetch_payload(self, request_url, params, skip_rate_limiter=False):
+        response = self._request_with_retry(
+            "GET",
+            request_url,
+            skip_rate_limiter=skip_rate_limiter,
+            params=params,
+        )
+        if response.status_code != 200:
+            text = response.text[:500]
+            raise RuntimeError(f"HTTP {response.status_code} przy GET /v1/articles: {text}")
+        payload = json.loads(response.content.decode("utf-8", errors="replace"))
+        items = self._extract_articles(payload)
+        return payload, items
+
+    def _build_params(self, page_limit, mode, page=None, offset=None, cursor_param="", cursor_value=""):
+        params = self._page_size_params(page_limit)
+        if mode == "page" and page is not None:
+            params["page"] = page
+        elif mode == "offset" and offset is not None:
+            params["offset"] = offset
+        elif mode == "cursor" and cursor_param and cursor_value:
+            params[cursor_param] = cursor_value
+        return params
+
+    def _discover_numeric_mode(self, base_url, page_limit, first_items):
+        if not first_items:
+            return None
+
+        first_fp = self._batch_fingerprint(first_items)
+        probes = [
+            ("page", self._build_params(page_limit, "page", page=2)),
+            ("offset", self._build_params(page_limit, "offset", offset=len(first_items))),
+        ]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            future_map = {
+                pool.submit(self._fetch_payload, base_url, params): mode
+                for mode, params in probes
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                mode = future_map[future]
+                try:
+                    _payload, items = future.result()
+                except Exception as exc:
+                    self.log(f"Probe {mode} nieudany: {exc}")
+                    continue
+
+                fp = self._batch_fingerprint(items)
+                if items and fp != first_fp:
+                    return mode
+
+        return None
+
+    @staticmethod
+    def _extract_title(article):
+        title = article.get("title")
+        if isinstance(title, str):
+            return title
+        if isinstance(title, list):
+            preferred_langs = ["pl-PL", "en-US", "sv-SE", "da-DK", "fi-FI", "nb-NO"]
+            by_lang = {}
+            for item in title:
+                if not isinstance(item, dict):
+                    continue
+                lang = str(item.get("language") or "").strip()
+                value = str(item.get("value") or "").strip()
+                if lang and value:
+                    by_lang[lang] = value
+
+            for lang in preferred_langs:
+                if lang in by_lang:
+                    return by_lang[lang]
+
+            for item in title:
+                if isinstance(item, dict) and item.get("value"):
+                    return str(item.get("value"))
+        if isinstance(title, dict) and title.get("value"):
+            return str(title.get("value"))
+        return ""
+
+    @staticmethod
+    def _extract_price_map(article):
+        price_obj = article.get("price")
+        out = {}
+
+        if isinstance(price_obj, (int, float, str)):
+            value = safe_float(price_obj)
+            if value != "":
+                out["ALL"] = {"price": value, "currency": ""}
+            return out
+
+        if isinstance(price_obj, dict):
+            value = price_obj.get("value")
+            if isinstance(value, dict):
+                amount = value.get("amount")
+                if amount is None:
+                    amount = value.get("amount_including_vat")
+                currency = value.get("currency") or ""
+                parsed = safe_float(amount)
+                if parsed != "":
+                    out["ALL"] = {"price": parsed, "currency": str(currency)}
+            return out
+
+        if isinstance(price_obj, list):
+            for item in price_obj:
+                if not isinstance(item, dict):
+                    continue
+                market = str(item.get("market") or "").strip() or "ALL"
+                value = item.get("value") or {}
+                amount = value.get("amount")
+                if amount is None:
+                    amount = value.get("amount_including_vat")
+                currency = str(value.get("currency") or "")
+                parsed = safe_float(amount)
+                if parsed != "":
+                    out[market] = {"price": parsed, "currency": currency}
+
+        return out
+
+    @staticmethod
+    def _extract_active(article):
+        status = article.get("status", "")
+        for_sale = article.get("for_sale")
+
+        if isinstance(for_sale, bool):
+            return for_sale
+        if isinstance(for_sale, str):
+            lowered = for_sale.strip().lower()
+            if lowered in {"true", "1", "yes", "tak"}:
+                return True
+            if lowered in {"false", "0", "no", "nie"}:
+                return False
+
+        if isinstance(status, str):
+            lowered = status.strip().lower()
+            if lowered in {"for sale", "for_sale", "active"}:
+                return True
+            if lowered in {"paused", "inactive", "not for sale", "not_for_sale", "deleted"}:
+                return False
+
+        return ""
+
+    def _fetch_articles_pages(self, page_limit, max_pages=10000, stop_event=None, on_items_callback=None):
+        base_url = f"{self.base_url}{ARTICLES_ENDPOINT}"
+        total_items_fetched = 0
+
+        mode = "page"
+        page = 1
+        offset = 0
+        cursor_param = ""
+        cursor_value = ""
+        next_url = ""
+        previous_batch_fingerprint = None
+        pages_done = 0
+
+        while pages_done < max_pages:
+            if stop_event and stop_event.is_set():
+                self.log("Otrzymano sygnal stop. Koncze pobieranie kolejnych stron.")
+                break
+
+            if next_url:
+                request_url = next_url
+                params = self._build_params(page_limit, mode="link")
+            else:
+                request_url = base_url
+                params = self._build_params(
+                    page_limit,
+                    mode=mode,
+                    page=page,
+                    offset=offset,
+                    cursor_param=cursor_param,
+                    cursor_value=cursor_value,
+                )
+
+            payload, items = self._fetch_payload(request_url, params)
+            if not items:
+                break
+
+            pages_done += 1
+            fingerprint = self._batch_fingerprint(items)
+            if previous_batch_fingerprint == fingerprint:
+                if pages_done == 2:
+                    discovered = self._discover_numeric_mode(base_url, page_limit, items)
+                    if discovered and discovered != mode:
+                        self.log(f"Wykryto inny tryb paginacji: {discovered}. Przelaczam.")
+                        mode = discovered
+                        next_url = ""
+                        if discovered == "page":
+                            page = 2
+                        else:
+                            offset = total_items_fetched
+                        continue
+
+                self.log("Wykryto powtarzajaca sie strone danych. Zatrzymuje paginacje, by uniknac petli.")
+                break
+            previous_batch_fingerprint = fingerprint
+
+            total_items_fetched += len(items)
+            if on_items_callback:
+                on_items_callback(items)
+            self.log(f"Pobrano strone {pages_done}: +{len(items)} (laczenie {total_items_fetched})")
+
+            link = self._extract_next_link(payload)
+            if link:
+                next_url = link if link.startswith("http") else f"{self.base_url}{link}"
+                mode = "link"
+                continue
+
+            next_cursor_param, next_cursor_value = self._extract_next_cursor(payload)
+            if next_cursor_param and next_cursor_value:
+                cursor_param = next_cursor_param
+                cursor_value = next_cursor_value
+                next_url = ""
+                mode = "cursor"
+                continue
+
+            total_count = self._extract_total_count(payload)
+            if mode in {"offset", "cursor", "link"}:
+                offset += len(items)
+                next_url = ""
+                if total_count is not None and offset < total_count:
+                    mode = "offset"
+                    continue
+
+            if mode == "page":
+                if len(items) < page_limit or page >= max_pages:
+                    break
+
+                start_page = page + 1
+                end_page = min(max_pages, page + PAGE_BURST_SIZE)
+                page_jobs = []
+                for next_page in range(start_page, end_page + 1):
+                    job_params = self._build_params(page_limit, mode="page", page=next_page)
+                    page_jobs.append((next_page, base_url, job_params))
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(page_jobs)) as pool:
+                    future_map = {
+                        pool.submit(self._fetch_payload, url, job_params, True): pnum
+                        for pnum, url, job_params in page_jobs
+                    }
+                    ordered = []
+                    for future in concurrent.futures.as_completed(future_map):
+                        pnum = future_map[future]
+                        payload_p, items_p = future.result()
+                        ordered.append((pnum, payload_p, items_p))
+
+                ordered.sort(key=lambda x: x[0])
+                stop_after_batch = False
+                for pnum, _payload_p, items_p in ordered:
+                    if stop_event and stop_event.is_set():
+                        stop_after_batch = True
+                        break
+
+                    if not items_p:
+                        stop_after_batch = True
+                        break
+
+                    fp = self._batch_fingerprint(items_p)
+                    if fp == previous_batch_fingerprint:
+                        stop_after_batch = True
+                        break
+
+                    previous_batch_fingerprint = fp
+                    total_items_fetched += len(items_p)
+                    if on_items_callback:
+                        on_items_callback(items_p)
+                    pages_done += 1
+                    self.log(f"Pobrano strone {pnum}: +{len(items_p)} (laczenie {total_items_fetched})")
+
+                    if len(items_p) < page_limit:
+                        stop_after_batch = True
+                        break
+
+                page = end_page + 1
+                if stop_after_batch:
+                    break
+
+                if page <= max_pages and PAGE_BURST_PAUSE_SECONDS > 0:
+                    self.log(
+                        f"Batch {end_page - start_page + 1} stron zakonczony. Czekam {PAGE_BURST_PAUSE_SECONDS}s przed kolejnym batchem."
+                    )
+                    for _ in range(PAGE_BURST_PAUSE_SECONDS):
+                        if stop_event and stop_event.is_set():
+                            break
+                        time.sleep(1)
+                    if stop_event and stop_event.is_set():
+                        self.log("Zatrzymano w trakcie oczekiwania miedzy batchami.")
+                        break
+                continue
+
+            # Fallback when endpoint ignores page numbers: try offset once first page returns a full batch.
+            if mode != "offset" and len(items) == page_limit:
+                mode = "offset"
+                offset += len(items)
+                next_url = ""
+                continue
+
+            break
+
+        return total_items_fetched
+
+    def _article_to_row(self, article):
+        if not isinstance(article, dict):
+            return None
+
+        sku = str(article.get("sku") or article.get("article_sku") or "").strip()
+        if not sku:
+            return None
+
+        qty = article.get("quantity")
+        if qty is None:
+            qty = article.get("stock", "")
+        qty = safe_int(qty)
+
+        prices = self._extract_price_map(article)
+        preferred_markets = ["SE", "DK", "FI", "NO", "ALL"]
+        primary_market = next((m for m in preferred_markets if m in prices), "")
+        if not primary_market and prices:
+            primary_market = sorted(prices.keys())[0]
+
+        primary_price = prices.get(primary_market, {}).get("price", "")
+        primary_currency = prices.get(primary_market, {}).get("currency", "")
+        title = self._extract_title(article)
+        active = self._extract_active(article)
+        status = str(article.get("status", ""))
+
+        return {
+            "sku": sku,
+            "name": title,
+            "quantity": qty,
+            "price": primary_price,
+            "currency": primary_currency,
+            "price_market": primary_market,
+            "price_SE": prices.get("SE", {}).get("price", ""),
+            "currency_SE": prices.get("SE", {}).get("currency", ""),
+            "price_DK": prices.get("DK", {}).get("price", ""),
+            "currency_DK": prices.get("DK", {}).get("currency", ""),
+            "price_FI": prices.get("FI", {}).get("price", ""),
+            "currency_FI": prices.get("FI", {}).get("currency", ""),
+            "price_NO": prices.get("NO", {}).get("price", ""),
+            "currency_NO": prices.get("NO", {}).get("currency", ""),
+            "active": active,
+            "status": status,
+        }
+
+    def export_articles_to_csv(self, output_path, page_limit=DEFAULT_PAGE_LIMIT, stop_event=None):
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        written_rows = 0
+        with open(output_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDNAMES, delimiter=";")
+            writer.writeheader()
+
+            def on_items(items):
+                nonlocal written_rows
+                rows = []
+                for article in items:
+                    row = self._article_to_row(article)
+                    if row is not None:
+                        rows.append(row)
+                if rows:
+                    writer.writerows(rows)
+                    written_rows += len(rows)
+                    handle.flush()
+                    self.log(f"Dopisano do CSV: +{len(rows)} (razem zapisane {written_rows})")
+
+            self._fetch_articles_pages(
+                page_limit=page_limit,
+                stop_event=stop_event,
+                on_items_callback=on_items,
+            )
+
+        return written_rows
+
+    def fetch_all_articles(self, page_limit=DEFAULT_PAGE_LIMIT, stop_event=None):
+        all_items = []
+
+        def append_items(items):
+            all_items.extend(items)
+
+        self._fetch_articles_pages(page_limit=page_limit, stop_event=stop_event, on_items_callback=append_items)
+
+        by_sku = {}
+        for article in all_items:
+            if not isinstance(article, dict):
+                continue
+            sku = str(article.get("sku") or article.get("article_sku") or "").strip()
+            if not sku:
+                continue
+
+            qty = article.get("quantity")
+            if qty is None:
+                qty = article.get("stock", "")
+            qty = safe_int(qty)
+
+            prices = self._extract_price_map(article)
+            preferred_markets = ["SE", "DK", "FI", "NO", "ALL"]
+            primary_market = next((m for m in preferred_markets if m in prices), "")
+            if not primary_market and prices:
+                primary_market = sorted(prices.keys())[0]
+
+            primary_price = prices.get(primary_market, {}).get("price", "")
+            primary_currency = prices.get(primary_market, {}).get("currency", "")
+            title = self._extract_title(article)
+            active = self._extract_active(article)
+            status = str(article.get("status", ""))
+
+            by_sku[sku] = {
+                "sku": sku,
+                "name": title,
+                "quantity": qty,
+                "price": primary_price,
+                "currency": primary_currency,
+                "price_market": primary_market,
+                "price_SE": prices.get("SE", {}).get("price", ""),
+                "currency_SE": prices.get("SE", {}).get("currency", ""),
+                "price_DK": prices.get("DK", {}).get("price", ""),
+                "currency_DK": prices.get("DK", {}).get("currency", ""),
+                "price_FI": prices.get("FI", {}).get("price", ""),
+                "currency_FI": prices.get("FI", {}).get("currency", ""),
+                "price_NO": prices.get("NO", {}).get("price", ""),
+                "currency_NO": prices.get("NO", {}).get("currency", ""),
+                "active": active,
+                "status": status,
+            }
+
+        return list(by_sku.values())
 
 
 class App(ctk.CTk):
@@ -152,22 +724,46 @@ class App(ctk.CTk):
 
         self.title(APP_TITLE)
         self.geometry("1100x760")
-        self.minsize(980, 660)
+        self.minsize(960, 660)
         self.configure(fg_color=BG_MAIN)
 
         self.accounts_path_var = ctk.StringVar(value=DEFAULT_ACCOUNTS_PATH)
         self.account_var = ctk.StringVar(value="")
-        self.skus_csv_var = ctk.StringVar(value="")
         self.output_csv_var = ctk.StringVar(value="")
         self.use_sandbox_var = ctk.BooleanVar(value=False)
-        self.batch_size_var = ctk.StringVar(value="200")
         self.rate_limit_var = ctk.StringVar(value=str(DEFAULT_REQUESTS_PER_MINUTE))
+        self.page_limit_var = ctk.StringVar(value=str(DEFAULT_PAGE_LIMIT))
 
         self.accounts = {}
         self.is_running = False
+        self.stop_event = threading.Event()
 
         self._build_ui()
         self._load_accounts()
+
+    @staticmethod
+    def _safe_filename_part(value):
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value.strip())
+        return safe.strip("_") or "konto"
+
+    def _resolve_output_dir(self, output_path):
+        output_path = output_path.strip()
+        if not output_path:
+            raise ValueError("Brak sciezki wyjsciowej.")
+
+        if os.path.isdir(output_path):
+            return output_path
+
+        lower = output_path.lower()
+        if lower.endswith(".csv"):
+            return os.path.dirname(output_path) or os.getcwd()
+
+        return output_path
+
+    def _build_account_output_path(self, output_dir, account_name, run_stamp):
+        safe_name = self._safe_filename_part(account_name)
+        filename = f"{safe_name}_{run_stamp}.csv"
+        return os.path.join(output_dir, filename)
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -186,7 +782,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             header,
-            text="Pobieranie statusow ofert CDON na podstawie SKU z pliku CSV.",
+            text="Pobieranie danych artykulow: SKU, ilosc, cena, nazwa, aktywnosc.",
             text_color=TEXT_MUTED,
             font=ctk.CTkFont(size=13),
         ).grid(row=1, column=0, padx=16, pady=(0, 14), sticky="w")
@@ -215,7 +811,7 @@ class App(ctk.CTk):
         ).grid(row=row, column=2, padx=(8, 14), pady=10)
 
         row += 1
-        ctk.CTkLabel(config, text="Konto", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
+        ctk.CTkLabel(config, text="Konto (podglad)", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
         self.account_menu = ctk.CTkOptionMenu(
             config,
             variable=self.account_var,
@@ -238,21 +834,7 @@ class App(ctk.CTk):
         ).grid(row=row, column=2, padx=(8, 14), pady=10)
 
         row += 1
-        ctk.CTkLabel(config, text="Plik SKU CSV", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
-        ctk.CTkEntry(config, textvariable=self.skus_csv_var, fg_color=BG_INPUT, text_color=TEXT).grid(
-            row=row, column=1, padx=8, pady=10, sticky="ew"
-        )
-        ctk.CTkButton(
-            config,
-            text="Wybierz",
-            width=90,
-            fg_color=ACCENT,
-            hover_color=ACCENT_HOVER,
-            command=self._pick_skus_csv,
-        ).grid(row=row, column=2, padx=(8, 14), pady=10)
-
-        row += 1
-        ctk.CTkLabel(config, text="Plik wynikowy CSV", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
+        ctk.CTkLabel(config, text="Folder/plik wynikowy", text_color=TEXT).grid(row=row, column=0, padx=14, pady=10, sticky="w")
         ctk.CTkEntry(config, textvariable=self.output_csv_var, fg_color=BG_INPUT, text_color=TEXT).grid(
             row=row, column=1, padx=8, pady=10, sticky="ew"
         )
@@ -268,7 +850,6 @@ class App(ctk.CTk):
         row += 1
         options = ctk.CTkFrame(config, fg_color="transparent")
         options.grid(row=row, column=0, columnspan=3, padx=14, pady=(2, 12), sticky="ew")
-        options.grid_columnconfigure(3, weight=1)
 
         ctk.CTkCheckBox(
             options,
@@ -280,13 +861,13 @@ class App(ctk.CTk):
             border_color=BORDER,
         ).grid(row=0, column=0, padx=(0, 14), pady=4, sticky="w")
 
-        ctk.CTkLabel(options, text="Batch size", text_color=TEXT).grid(row=0, column=1, padx=(0, 8), sticky="w")
-        ctk.CTkEntry(options, width=80, textvariable=self.batch_size_var, fg_color=BG_INPUT, text_color=TEXT).grid(
+        ctk.CTkLabel(options, text="Limit req/min", text_color=TEXT).grid(row=0, column=1, padx=(0, 8), sticky="w")
+        ctk.CTkEntry(options, width=90, textvariable=self.rate_limit_var, fg_color=BG_INPUT, text_color=TEXT).grid(
             row=0, column=2, padx=(0, 14), sticky="w"
         )
 
-        ctk.CTkLabel(options, text="Limit req/min", text_color=TEXT).grid(row=0, column=3, padx=(0, 8), sticky="w")
-        ctk.CTkEntry(options, width=90, textvariable=self.rate_limit_var, fg_color=BG_INPUT, text_color=TEXT).grid(
+        ctk.CTkLabel(options, text="Page limit", text_color=TEXT).grid(row=0, column=3, padx=(0, 8), sticky="w")
+        ctk.CTkEntry(options, width=90, textvariable=self.page_limit_var, fg_color=BG_INPUT, text_color=TEXT).grid(
             row=0, column=4, padx=(0, 0), sticky="w"
         )
 
@@ -296,7 +877,7 @@ class App(ctk.CTk):
 
         self.start_btn = ctk.CTkButton(
             controls,
-            text="Pobierz statusy",
+            text="Pobierz artykuly",
             fg_color=ACCENT,
             hover_color=ACCENT_HOVER,
             text_color="#ffffff",
@@ -307,6 +888,18 @@ class App(ctk.CTk):
 
         self.stop_btn = ctk.CTkButton(
             controls,
+            text="Zatrzymaj i zapisz",
+            fg_color="#f7b267",
+            hover_color="#ea9d4e",
+            text_color=TEXT,
+            width=170,
+            state="disabled",
+            command=self._request_stop,
+        )
+        self.stop_btn.grid(row=0, column=1, padx=(0, 8), sticky="w")
+
+        self.clear_btn = ctk.CTkButton(
+            controls,
             text="Wyczysc log",
             fg_color="#f2c7de",
             hover_color="#e9b5d1",
@@ -314,10 +907,10 @@ class App(ctk.CTk):
             width=130,
             command=self._clear_log,
         )
-        self.stop_btn.grid(row=0, column=1, padx=(0, 8), sticky="w")
+        self.clear_btn.grid(row=0, column=2, padx=(0, 8), sticky="w")
 
         self.progress = ctk.CTkProgressBar(controls, progress_color=ACCENT, fg_color="#f4d5e5")
-        self.progress.grid(row=0, column=2, sticky="ew")
+        self.progress.grid(row=0, column=3, sticky="ew")
         self.progress.set(0)
 
         log_panel = ctk.CTkFrame(content, fg_color=BG_PANEL, border_color=BORDER, border_width=1)
@@ -363,18 +956,6 @@ class App(ctk.CTk):
         if path:
             self.accounts_path_var.set(path)
             self._load_accounts()
-
-    def _pick_skus_csv(self):
-        path = filedialog.askopenfilename(
-            title="Wybierz CSV z SKU",
-            filetypes=[("CSV", "*.csv"), ("Wszystkie", "*.*")],
-        )
-        if path:
-            self.skus_csv_var.set(path)
-            if not self.output_csv_var.get().strip():
-                stem = Path(path).stem
-                out_path = str(Path(path).with_name(f"{stem}_statuses.csv"))
-                self.output_csv_var.set(out_path)
 
     def _pick_output_csv(self):
         path = filedialog.asksaveasfilename(
@@ -430,98 +1011,6 @@ class App(ctk.CTk):
         if values:
             self.account_var.set(values[0])
 
-    def _read_skus_csv(self, path):
-        if not os.path.exists(path):
-            raise FileNotFoundError("Nie znaleziono pliku SKU CSV")
-
-        skus = []
-        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
-            sample = handle.read(4096)
-            handle.seek(0)
-            delimiter = ";" if sample.count(";") >= sample.count(",") else ","
-
-            reader = csv.DictReader(handle, delimiter=delimiter)
-            headers = [h.strip() for h in (reader.fieldnames or [])]
-            header_lc = {h.lower(): h for h in headers}
-
-            sku_col = None
-            for candidate in ["sku", "seller_sku", "item_sku", "id"]:
-                if candidate in header_lc:
-                    sku_col = header_lc[candidate]
-                    break
-
-            if sku_col is None:
-                if headers:
-                    sku_col = headers[0]
-                else:
-                    raise ValueError("CSV nie ma naglowkow")
-
-            for row in reader:
-                value = (row.get(sku_col) or "").strip()
-                if value and value.lower() != "nan":
-                    skus.append(value)
-
-        # Usuniecie duplikatow z zachowaniem kolejnosci
-        return list(dict.fromkeys(skus))
-
-    def _flatten_statuses(self, account_name, response_json):
-        rows = []
-        statuses = response_json.get("statuses") or []
-
-        for status_obj in statuses:
-            base = {
-                "account": account_name,
-                "correlation_id": status_obj.get("correlation_id", ""),
-                "article_id": status_obj.get("article_id", ""),
-                "sku": status_obj.get("sku", ""),
-                "action": status_obj.get("action", ""),
-            }
-            markets = status_obj.get("markets") or []
-
-            if not markets:
-                rows.append(
-                    {
-                        **base,
-                        "market": "",
-                        "status": "",
-                        "error_code": "",
-                    }
-                )
-                continue
-
-            for market_info in markets:
-                rows.append(
-                    {
-                        **base,
-                        "market": market_info.get("market", ""),
-                        "status": market_info.get("status", ""),
-                        "error_code": market_info.get("error_code", ""),
-                    }
-                )
-
-        return rows
-
-    def _write_output_csv(self, path, rows):
-        out_dir = os.path.dirname(path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-
-        fieldnames = [
-            "account",
-            "correlation_id",
-            "article_id",
-            "sku",
-            "action",
-            "market",
-            "status",
-            "error_code",
-        ]
-
-        with open(path, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=";")
-            writer.writeheader()
-            writer.writerows(rows)
-
     def _validate(self):
         if self.is_running:
             return False
@@ -531,22 +1020,13 @@ class App(ctk.CTk):
             messagebox.showerror("Blad", "Wybierz poprawne konto z listy.")
             return False
 
-        skus_path = self.skus_csv_var.get().strip()
-        if not skus_path:
-            messagebox.showerror("Blad", "Wybierz plik CSV z SKU.")
-            return False
-
         output_path = self.output_csv_var.get().strip()
         if not output_path:
-            messagebox.showerror("Blad", "Wybierz plik wynikowy CSV.")
+            messagebox.showerror("Blad", "Wybierz folder lub plik wynikowy.")
             return False
 
-        try:
-            batch_size = int(self.batch_size_var.get().strip())
-            if batch_size < 1 or batch_size > 1000:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Blad", "Batch size musi byc liczba od 1 do 1000.")
+        if not self.accounts:
+            messagebox.showerror("Blad", "Brak kont do pobrania.")
             return False
 
         try:
@@ -557,97 +1037,116 @@ class App(ctk.CTk):
             messagebox.showerror("Blad", f"Limit req/min musi byc liczba od 1 do {MAX_REQUESTS_PER_MINUTE}.")
             return False
 
+        try:
+            page_limit = int(self.page_limit_var.get().strip())
+            if page_limit < 1 or page_limit > MAX_PAGE_LIMIT:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Blad", f"Page limit musi byc liczba od 1 do {MAX_PAGE_LIMIT}.")
+            return False
+
         return True
 
     def _set_running(self, running):
         self.is_running = running
         state = "disabled" if running else "normal"
         self.start_btn.configure(state=state)
+        self.stop_btn.configure(state="normal" if running else "disabled")
+
+    def _request_stop(self):
+        if not self.is_running:
+            return
+        self.stop_event.set()
+        self._log("Otrzymano polecenie zatrzymania. Zapisze to, co juz pobrano.")
 
     def _start(self):
         if not self._validate():
             return
 
+        self.stop_event.clear()
         self._set_running(True)
         self.progress.set(0)
-
         worker = threading.Thread(target=self._run_job, daemon=True)
         worker.start()
 
     def _run_job(self):
         try:
-            account_name = self.account_var.get().strip()
-            creds = self.accounts[account_name]
-            skus_path = self.skus_csv_var.get().strip()
             output_path = self.output_csv_var.get().strip()
-            batch_size = int(self.batch_size_var.get().strip())
             req_per_min = int(self.rate_limit_var.get().strip())
+            page_limit = int(self.page_limit_var.get().strip())
             use_sandbox = bool(self.use_sandbox_var.get())
+            output_dir = self._resolve_output_dir(output_path)
+            os.makedirs(output_dir, exist_ok=True)
+            run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            accounts_to_fetch = list(self.accounts.items())
 
-            self._log(f"Konto: {account_name}")
+            if not accounts_to_fetch:
+                raise RuntimeError("Brak kont do pobrania.")
+
+            self._log(f"Konta do pobrania: {len(accounts_to_fetch)}")
             self._log(f"Srodowisko: {'SANDBOX' if use_sandbox else 'PRODUKCJA'}")
             self._log(f"Limit API: {req_per_min} req/min")
-            self._log("Wczytywanie SKU...")
-            skus = self._read_skus_csv(skus_path)
-            if not skus:
-                raise RuntimeError("Brak SKU do przetworzenia")
+            self._log(f"Page limit: {page_limit}")
+            self._log(f"Folder wyjsciowy: {output_dir}")
 
-            self._log(f"Liczba SKU: {len(skus)}")
+            self._log("Pobieranie artykulow z API ze wszystkich kont...")
 
-            client = CDONStatusesClient(
-                merchant_id=creds["merchant_id"],
-                api_token=creds["api_token"],
-                use_sandbox=use_sandbox,
-                requests_per_minute=req_per_min,
-                max_retries=DEFAULT_MAX_RETRIES,
-                backoff_seconds=DEFAULT_BACKOFF_SECONDS,
-                log_callback=self._log,
-            )
-
-            all_rows = []
-            all_found_skus = set()
-
-            sku_batches = list(chunks(skus, batch_size))
-            total = len(sku_batches)
-
-            for idx, batch in enumerate(sku_batches, start=1):
-                self._log(f"Batch {idx}/{total}: {len(batch)} SKU")
-                response = client.fetch_statuses_by_skus(batch)
-                rows = self._flatten_statuses(account_name, response)
-                all_rows.extend(rows)
-
-                for st in response.get("statuses") or []:
-                    sku_val = st.get("sku")
-                    if sku_val:
-                        all_found_skus.add(str(sku_val))
-
-                self.progress.set(idx / total)
-
-            missing = [sku for sku in skus if sku not in all_found_skus]
-            for sku in missing:
-                all_rows.append(
-                    {
-                        "account": account_name,
-                        "correlation_id": "",
-                        "article_id": "",
-                        "sku": sku,
-                        "action": "",
-                        "market": "",
-                        "status": "not_returned",
-                        "error_code": "",
-                    }
+            def run_one_account(account_name, creds):
+                account_output_path = self._build_account_output_path(output_dir, account_name, run_stamp)
+                self._log(f"[{account_name}] Start -> {account_output_path}")
+                client = CDONArticlesClient(
+                    merchant_id=creds["merchant_id"],
+                    api_token=creds["api_token"],
+                    use_sandbox=use_sandbox,
+                    requests_per_minute=req_per_min,
+                    max_retries=DEFAULT_MAX_RETRIES,
+                    backoff_seconds=DEFAULT_BACKOFF_SECONDS,
+                    log_callback=lambda msg: self._log(f"[{account_name}] {msg}"),
                 )
+                written_rows = client.export_articles_to_csv(
+                    output_path=account_output_path,
+                    page_limit=page_limit,
+                    stop_event=self.stop_event,
+                )
+                self._log(f"[{account_name}] Zakonczono. Artykuly: {written_rows}")
+                return account_name, written_rows, account_output_path
 
-            self._write_output_csv(output_path, all_rows)
-            self._log(f"Zapisano: {output_path}", SUCCESS)
-            self._log(f"Rekordy: {len(all_rows)}", SUCCESS)
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(accounts_to_fetch)) as pool:
+                future_map = {
+                    pool.submit(run_one_account, account_name, creds): account_name
+                    for account_name, creds in accounts_to_fetch
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    account_name = future_map[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        self._log(f"[{account_name}] Blad: {exc}", ERROR)
+
+            total_rows = sum(item[1] for item in results)
+            self.progress.set(0.8)
+            self.progress.set(1.0)
+
+            self._log(f"Zapisane pliki: {len(results)}", SUCCESS)
+            self._log(f"Artykuly lacznie: {total_rows}", SUCCESS)
+
+            if self.stop_event.is_set():
+                title = "Zatrzymano"
+                message = (
+                    f"Zatrzymano pobieranie przez uzytkownika.\n"
+                    f"Zapisane pliki: {len(results)}\nArtykuly lacznie: {total_rows}."
+                )
+            else:
+                title = "Gotowe"
+                message = (
+                    f"Pobrano dane dla {len(results)} kont.\n"
+                    f"Artykuly lacznie: {total_rows}."
+                )
 
             self.after(
                 0,
-                lambda: messagebox.showinfo(
-                    "Gotowe",
-                    f"Pobrano statusy dla {len(skus)} SKU.\nZapisano {len(all_rows)} rekordow.",
-                ),
+                lambda: messagebox.showinfo(title, message),
             )
         except Exception as exc:
             self._log(f"Blad: {exc}", ERROR)
