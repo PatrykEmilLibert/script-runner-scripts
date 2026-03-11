@@ -1,5 +1,0 @@
-concurrent
-customtkinter
-openpyxl
-tkinter
-xml
