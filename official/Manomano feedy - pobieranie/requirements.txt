@@ -1,4 +1,3 @@
-concurrent
 customtkinter
 openpyxl
 tkinter
