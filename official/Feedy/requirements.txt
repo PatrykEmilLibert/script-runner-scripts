@@ -2,3 +2,4 @@ keyboard
 pyautogui
 tkinter
 ttkbootstrap
+opencv-python
