@@ -1,4 +1,0 @@
-customtkinter
-openpyxl
-tkinter
-xml
