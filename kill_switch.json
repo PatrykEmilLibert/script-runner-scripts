@@ -1,5 +1,5 @@
 {
-  "blocked": false,
+  "blocked": true,
   "reason": "Manual toggle by admin",
   "whitelist": [],
   "message": ""
