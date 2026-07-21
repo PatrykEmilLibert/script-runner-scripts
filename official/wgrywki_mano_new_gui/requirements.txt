@@ -1,0 +1,4 @@
+PySide6
+gui_qt_amno_common
+pandas
+yaml
