@@ -1,4 +1,0 @@
-PyQt6
-dataclasses
-html
-openpyxl
