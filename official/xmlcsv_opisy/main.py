@@ -1,3 +1,20 @@
+"""
+XML -> CSV z wyczyszczonymi opisami.
+
+Kopia xmlcsv2new.py z dwiema dodatkowymi kolumnami, wypelnianymi zawsze:
+
+  desc_plain      - opis bez zadnego HTML-a, ale z zachowanymi enterami
+                    (akapity, punktory, numeracja), przyciety do 2000 znakow
+                    po kropce / koncu pozycji listy
+  desc_marketing  - opis w HTML zawezonym do bialej listy Cdiscount
+                    (b, strong, i, em, u, span, p, div, br, hr, ul, ol, li,
+                    h1-h6), przyciety do 5000 znakow na granicy bloku,
+                    z domknieciem tagow
+
+Reszta - linki, filtry, raport bledow, uklad CSV - dziala identycznie jak
+w xmlcsv2new.py. Logika czyszczenia siedzi w desc_cleaner.py.
+"""
+
 import concurrent.futures
 import csv
 import ctypes
@@ -41,13 +58,18 @@ except ImportError as error:
         "Brak PySide6. Zainstaluj: pip install PySide6 openpyxl"
     ) from error
 
-# Korekta znakow (encje HTML -> polskie litery, usuwanie emoji) - dokladnie ta
-# sama funkcja, ktorej uzywa "tlumaczenia v2.py". Zyje w desc_cleaner.py.
+# Korekta znakow i czyszczenie opisow - ten sam desc_cleaner.py, ktorego uzywaja
+# xmlcsv2new.py oraz "tlumaczenia v2.py".
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 try:
-    from desc_cleaner import correct_text
+    from desc_cleaner import (
+        MARKETING_LIMIT,
+        PLAIN_LIMIT,
+        build_descriptions,
+        correct_text,
+    )
 except ImportError as error:
     raise ImportError(
         "Nie znaleziono desc_cleaner.py obok skryptu. "
@@ -68,7 +90,12 @@ BASE_FIELDS = [
     "cat",
     "name",
     "desc",
+    "desc_plain",
+    "desc_marketing",
 ]
+# Limity narzucone przez Cdiscount: 2000 znakow czystego tekstu, 5000 HTML-a.
+PLAIN_DESC_LIMIT = PLAIN_LIMIT
+MARKETING_DESC_LIMIT = MARKETING_LIMIT
 # W feedach id_bl siedzi jako <attrs><a name="id_bl">..., wyciągamy go na stałą kolumnę.
 ID_BL_ATTR = "id_bl"
 CSV_DELIMITER = "|"
@@ -91,6 +118,24 @@ def clean_field(text):
     adres, a emoji tam nie występują.
     """
     return correct_text(clean_text(text)) or ""
+
+
+def inner_markup(element):
+    """
+    Zwraca surową treść elementu razem z HTML-em.
+
+    Opis w feedzie bywa tekstem/CDATA (wtedy .text wystarcza) albo prawdziwymi
+    pod-elementami XML (wtedy trzeba je zserializować z powrotem).
+    """
+    if element is None:
+        return ""
+    parts = [element.text or ""]
+    for child in element:
+        try:
+            parts.append(ET.tostring(child, encoding="unicode"))
+        except Exception:
+            parts.append("".join(child.itertext()))
+    return "".join(parts)
 
 
 def load_filter_ids(file_path):
@@ -161,7 +206,9 @@ def parse_xml(file_path):
     Zwraca (atrybuty, maks_obrazow, dane, None) lub ([], 0, [], powod_bledu).
 
     Pola tekstowe przechodzą korektę znaków (encje HTML -> polskie litery,
-    usuwanie emoji) — tak samo jak w "tlumaczenia v2.py".
+    usuwanie emoji) — tak samo jak w "tlumaczenia v2.py". Do każdego wiersza
+    dochodzą kolumny desc_plain i desc_marketing wyliczone z surowej treści
+    <desc> (razem z HTML-em, jeśli feed go tam trzyma).
     """
     try:
         tree = ET.parse(file_path)
@@ -187,6 +234,14 @@ def parse_xml(file_path):
                 "name": clean_field(name_elem.text) if name_elem is not None else "",
                 "desc": clean_field(desc_elem.text) if desc_elem is not None else "",
             }
+
+            desc_plain, desc_marketing = build_descriptions(
+                inner_markup(desc_elem),
+                plain_limit=PLAIN_DESC_LIMIT,
+                html_limit=MARKETING_DESC_LIMIT,
+            )
+            row["desc_plain"] = desc_plain
+            row["desc_marketing"] = desc_marketing
 
             attrs_elem = element.find("attrs")
             if attrs_elem is not None:
@@ -517,6 +572,18 @@ class ProcessorThread(QThread):
                 f"Błędy parsowania: {len(parse_errors)}",
             ]
 
+            plain_lengths = [len(row.get("desc_plain") or "") for row in all_rows]
+            html_lengths = [len(row.get("desc_marketing") or "") for row in all_rows]
+            summary_lines.append(
+                f"desc_plain: max {max(plain_lengths) if plain_lengths else 0}"
+                f"/{PLAIN_DESC_LIMIT} zn., "
+                f"desc_marketing: max {max(html_lengths) if html_lengths else 0}"
+                f"/{MARKETING_DESC_LIMIT} zn."
+            )
+            summary_lines.append(
+                f"Produkty bez opisu: {sum(1 for v in plain_lengths if v == 0)}"
+            )
+
             extra_lines = []
             if self.avail_only:
                 extra_lines.append(
@@ -588,7 +655,7 @@ class GlassCard(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Konwerter XML → CSV")
+        self.setWindowTitle("Konwerter XML → CSV z opisami")
         self.resize(760, 640)
         self.setMinimumSize(620, 560)
 
@@ -628,12 +695,14 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(28, 20, 28, 20)
         header_layout.setSpacing(6)
 
-        title = QLabel("Konwerter XML → CSV")
+        title = QLabel("Konwerter XML → CSV z opisami")
         title.setObjectName("Title")
         title.setWordWrap(True)
 
         subtitle = QLabel(
-            "Pobierz wiele feedów XML jednocześnie i połącz je w jeden plik CSV."
+            "Pobierz wiele feedów XML, połącz je w jeden plik CSV i dołóż dwie "
+            "kolumny opisu: desc_plain (czysty tekst, 2000 zn.) oraz "
+            "desc_marketing (HTML dla Cdiscount, 5000 zn.)."
         )
         subtitle.setObjectName("Subtitle")
         subtitle.setWordWrap(True)
