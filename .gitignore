@@ -29,3 +29,10 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# ScriptRunner: per-run temporary script copies (never publish)
+.sr_runtime_*
+
+# ScriptRunner: script output data (regenerated locally; must never be pushed)
+combined_full_aps*.csv
+file_records_metadata.csv
