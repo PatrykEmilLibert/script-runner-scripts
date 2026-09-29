@@ -1,0 +1,8 @@
+PySide6
+dataclasses
+html
+openpyxl
+requests
+traceback
+winreg
+xml
