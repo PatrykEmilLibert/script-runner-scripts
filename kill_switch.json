@@ -1,5 +1,6 @@
 {
   "blocked": false,
   "reason": "Manual toggle by admin",
-  "message": ""
+  "message": "",
+  "updated_at": "2026-10-08T12:12:34+02:00"
 }
