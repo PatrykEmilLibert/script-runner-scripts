@@ -1,0 +1,8 @@
+bol_api_config_store
+customtkinter
+dataclasses
+decimal
+openpyxl
+pandas
+requests
+tkinter
