@@ -1,0 +1,6 @@
+customtkinter
+dataclasses
+openpyxl
+pandas
+requests
+tkinter
