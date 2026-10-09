@@ -1,7 +1,0 @@
-customtkinter
-dataclasses
-decimal
-openpyxl
-pandas
-requests
-tkinter
