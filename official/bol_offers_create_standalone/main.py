@@ -18,12 +18,13 @@ from typing import Any
 import customtkinter as ctk
 import pandas as pd
 import requests
-from bol_api_config_store import BolApiConfigStore, BolApiSettings
 from openpyxl import load_workbook
 from tkinter import filedialog, messagebox
 
 
 APP_TITLE = "BOL Offers Creator (MVP)"
+BOL_CLIENT_ID = 'cc4f5c67-4895-437e-b509-c813715ddce1'
+BOL_CLIENT_SECRET = 'f23n8703apiQ(@6(NTEuXkZ!FpcVsKQrMWHZmq!(?H+mG2!LWBc?v3@pbXWCamW!'
 DEFAULT_API_URL = "https://api.bol.com/retailer/offers"
 DEFAULT_UPDATE_API_URL = "https://api.bol.com/retailer/offers/{offer-id}"
 DEFAULT_AUTH_URL = "https://login.bol.com/token"
@@ -469,10 +470,8 @@ class OffersCreatorApp(ctk.CTk):
         self.prepared_requests: list[dict[str, Any]] = []
         self.columns: list[str] = []
         self._stop_event = threading.Event()
-        self.api_settings, self.api_settings_path = BolApiConfigStore.load()
 
         self._build_ui()
-        self._apply_api_settings_to_ui()
         self._refresh_spec_labels()
         if self.listed_csv_path:
             self.listed_file_entry.insert(0, str(self.listed_csv_path))
@@ -565,35 +564,6 @@ class OffersCreatorApp(ctk.CTk):
         api_frame.pack(fill="x", padx=18, pady=(6, 10))
         api_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(api_frame, text="API URL", text_color=TEXT).grid(row=0, column=0, sticky="w", padx=10, pady=10)
-        self.api_entry = ctk.CTkEntry(api_frame, fg_color="white", border_color=BORDER, text_color=TEXT)
-        self.api_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=10)
-        self.api_entry.insert(0, DEFAULT_API_URL)
-
-        ctk.CTkLabel(api_frame, text="Auth URL", text_color=TEXT).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 10))
-        self.auth_entry = ctk.CTkEntry(api_frame, fg_color="white", border_color=BORDER, text_color=TEXT)
-        self.auth_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=(0, 10))
-        self.auth_entry.insert(0, DEFAULT_AUTH_URL)
-
-        ctk.CTkLabel(api_frame, text="Client ID", text_color=TEXT).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
-        self.client_id_entry = ctk.CTkEntry(api_frame, fg_color="white", border_color=BORDER, text_color=TEXT)
-        self.client_id_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=(0, 10))
-
-        ctk.CTkLabel(api_frame, text="Client Secret", text_color=TEXT).grid(row=3, column=0, sticky="w", padx=10, pady=(0, 10))
-        self.client_secret_entry = ctk.CTkEntry(api_frame, fg_color="white", border_color=BORDER, text_color=TEXT, show="*")
-        self.client_secret_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=(0, 10))
-
-        ctk.CTkLabel(api_frame, text="Economic Operators API URL", text_color=TEXT).grid(
-            row=4,
-            column=0,
-            sticky="w",
-            padx=10,
-            pady=(0, 10),
-        )
-        self.economic_operators_api_entry = ctk.CTkEntry(api_frame, fg_color="white", border_color=BORDER, text_color=TEXT)
-        self.economic_operators_api_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(0, 10))
-        self.economic_operators_api_entry.insert(0, DEFAULT_ECONOMIC_OPERATORS_API_URL)
-
         self.auto_lookup_offer_id_var = ctk.BooleanVar(value=True)
         self.auto_lookup_offer_id_chk = ctk.CTkCheckBox(
             api_frame,
@@ -603,19 +573,7 @@ class OffersCreatorApp(ctk.CTk):
             fg_color=ACCENT,
             hover_color=ACCENT_HOVER,
         )
-        self.auto_lookup_offer_id_chk.grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
-
-        self.save_api_settings_btn = ctk.CTkButton(
-            api_frame,
-            text="Zapisz dane API",
-            command=self.save_api_settings,
-            fg_color="#ffd6e8",
-            hover_color="#ffc0dc",
-            text_color=TEXT,
-            height=30,
-            width=180,
-        )
-        self.save_api_settings_btn.grid(row=6, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 10))
+        self.auto_lookup_offer_id_chk.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=10)
 
         self.required_label = ctk.CTkLabel(root, text="Wymagane pola z YAML: —", text_color=MUTED, wraplength=900, justify="left")
         self.required_label.pack(anchor="w", padx=18, pady=(0, 8))
@@ -686,7 +644,6 @@ class OffersCreatorApp(ctk.CTk):
             self.xlsx_entry.insert(0, str(DEFAULT_TEMPLATE_XLSX_PATH))
 
     def _on_mode_change(self, selected_mode: str) -> None:
-        self._refresh_api_url_for_mode(selected_mode)
         self._refresh_spec_labels()
         if selected_mode == "UPDATE":
             self.fixed_rules_label.configure(
@@ -701,18 +658,6 @@ class OffersCreatorApp(ctk.CTk):
                     "schedule = BOL_DELIVERY_PROMISE | kraje: NL + BE"
                 )
             )
-
-    def _refresh_api_url_for_mode(self, mode: str) -> None:
-        current_url = self.api_entry.get().strip()
-        default_create = self.api_settings.offers_url or DEFAULT_API_URL
-        default_update = self.api_settings.update_offer_url or DEFAULT_UPDATE_API_URL
-
-        if mode == "UPDATE" and current_url in {DEFAULT_API_URL, default_create}:
-            self.api_entry.delete(0, "end")
-            self.api_entry.insert(0, default_update)
-        elif mode == "CREATE" and current_url in {DEFAULT_UPDATE_API_URL, default_update}:
-            self.api_entry.delete(0, "end")
-            self.api_entry.insert(0, default_create)
 
     def _refresh_spec_labels(self) -> None:
         mode = self.mode_var.get()
@@ -751,53 +696,6 @@ class OffersCreatorApp(ctk.CTk):
         )
         button.pack(side="left", padx=(0, 10))
         return button
-
-    def _apply_api_settings_to_ui(self) -> None:
-        self.client_id_entry.delete(0, "end")
-        self.client_id_entry.insert(0, self.api_settings.client_id)
-        self.client_secret_entry.delete(0, "end")
-        self.client_secret_entry.insert(0, self.api_settings.client_secret)
-        self.auth_entry.delete(0, "end")
-        self.auth_entry.insert(0, self.api_settings.auth_url or DEFAULT_AUTH_URL)
-        self.economic_operators_api_entry.delete(0, "end")
-        self.economic_operators_api_entry.insert(
-            0,
-            self.api_settings.economic_operators_url or DEFAULT_ECONOMIC_OPERATORS_API_URL,
-        )
-
-        default_api = self.api_settings.offers_url or DEFAULT_API_URL
-        self.api_entry.delete(0, "end")
-        self.api_entry.insert(0, default_api)
-
-    def _collect_api_settings_from_ui(self) -> BolApiSettings:
-        current_mode = self.mode_var.get()
-        api_url = self.api_entry.get().strip()
-
-        offers_url = self.api_settings.offers_url or DEFAULT_API_URL
-        update_offer_url = self.api_settings.update_offer_url or DEFAULT_UPDATE_API_URL
-        if current_mode == "UPDATE":
-            update_offer_url = api_url or DEFAULT_UPDATE_API_URL
-        else:
-            offers_url = api_url or DEFAULT_API_URL
-
-        return BolApiSettings(
-            client_id=self.client_id_entry.get().strip(),
-            client_secret=self.client_secret_entry.get().strip(),
-            auth_url=self.auth_entry.get().strip() or DEFAULT_AUTH_URL,
-            offers_url=offers_url,
-            update_offer_url=update_offer_url,
-            economic_operators_url=self.economic_operators_api_entry.get().strip() or DEFAULT_ECONOMIC_OPERATORS_API_URL,
-        )
-
-    def save_api_settings(self) -> None:
-        try:
-            self.api_settings = self._collect_api_settings_from_ui()
-            self.api_settings_path = BolApiConfigStore.save(self.api_settings, self.api_settings_path)
-            self._log(f"Zapisano dane API do: {self.api_settings_path}")
-            self._set_status("Dane API zapisane.")
-        except Exception as exc:
-            self._log(f"Błąd zapisu danych API: {exc}")
-            self._set_status(f"Błąd zapisu danych API: {exc}", is_error=True)
 
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1040,16 +938,11 @@ class OffersCreatorApp(ctk.CTk):
         self._log(f"One click processing ({mode}): start automatycznego budowania payloadów z XLSX.")
         self._stop_event.clear()
 
-        client_id = self.client_id_entry.get().strip()
-        client_secret = self.client_secret_entry.get().strip()
-        if not client_id or not client_secret:
-            messagebox.showwarning("Brak danych API", "Wpisz Client ID i Client Secret.")
-            return
-
-        api_url = self.api_entry.get().strip() or DEFAULT_API_URL
-        auth_url = self.auth_entry.get().strip() or DEFAULT_AUTH_URL
-        economic_operators_api_url = self.economic_operators_api_entry.get().strip() or DEFAULT_ECONOMIC_OPERATORS_API_URL
-        self.save_api_settings()
+        client_id = BOL_CLIENT_ID
+        client_secret = BOL_CLIENT_SECRET
+        api_url = DEFAULT_UPDATE_API_URL if mode == "UPDATE" else DEFAULT_API_URL
+        auth_url = DEFAULT_AUTH_URL
+        economic_operators_api_url = DEFAULT_ECONOMIC_OPERATORS_API_URL
         mapping = self._build_mapping()
 
         def _lookup_then_send() -> None:
